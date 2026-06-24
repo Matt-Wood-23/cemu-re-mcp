@@ -51,6 +51,13 @@ class GdbRsp:
         self._rxbuf = bytearray()
         self._lock = threading.Lock()
         self._no_ack = False  # set after qStartNoAckMode succeeds
+        # GDB thread-id (hex string) of the thread that produced the most recent
+        # stop reply. Cemu's stub services `g`/`p` against a *default* thread, not
+        # the one that hit the breakpoint, so we must `Hg<tid>` before reading
+        # registers or we get a parked coreinit thread's context. None until first stop.
+        self._stop_thread: Optional[str] = None
+        # Whether the stub honors Hg thread selection (probed lazily; assume yes).
+        self._hg_ok = True
 
     # ----- connection lifecycle -----
 
@@ -206,7 +213,43 @@ class GdbRsp:
                 reply = self._read_packet()
             finally:
                 self._sock.settimeout(old)
-        return self._parse_stop_reply(reply)
+        stop = self._parse_stop_reply(reply)
+        self._capture_stop_thread(stop.raw)
+        return stop
+
+    def _capture_stop_thread(self, raw: str) -> None:
+        """Extract `thread:<hex>` from a T-packet so register reads can target it."""
+        marker = "thread:"
+        idx = raw.find(marker)
+        if idx == -1:
+            return
+        rest = raw[idx + len(marker):]
+        tid = ""
+        for ch in rest:
+            if ch in "0123456789abcdefABCDEF":
+                tid += ch
+            else:
+                break
+        if tid:
+            self._stop_thread = tid
+
+    def _select_stop_thread(self) -> None:
+        """`Hg<tid>` — point subsequent g/p reads at the thread that stopped.
+
+        Cemu's stub answers `g`/`p` against a default thread (often a parked
+        coreinit thread), NOT the breakpointed one, so without this the PC and
+        GPRs are from the wrong context. Best-effort: if the stub rejects Hg we
+        stop trying and fall back to the default thread."""
+        if not self._hg_ok or self._stop_thread is None:
+            return
+        try:
+            reply = self.cmd(f"Hg{self._stop_thread}")
+            if reply not in ("OK", ""):
+                # Some stubs echo nothing useful; treat non-OK as unsupported only
+                # if it's an error packet (cmd would have raised on E##).
+                pass
+        except GdbRspError:
+            self._hg_ok = False
 
     @staticmethod
     def _parse_stop_reply(reply: str) -> StopReason:
@@ -222,7 +265,9 @@ class GdbRsp:
     def query_halt_reason(self) -> StopReason:
         """`?` — what was the most recent halt reason?"""
         reply = self.cmd("?")
-        return self._parse_stop_reply(reply)
+        stop = self._parse_stop_reply(reply)
+        self._capture_stop_thread(stop.raw)
+        return stop
 
     def cont(self) -> None:
         """`vCont;c` — resume ALL threads. Does NOT block waiting for stop.
@@ -242,7 +287,9 @@ class GdbRsp:
         with self._lock:
             self._send_packet("vCont;s")
             reply = self._read_packet()
-        return self._parse_stop_reply(reply)
+        stop = self._parse_stop_reply(reply)
+        self._capture_stop_thread(stop.raw)
+        return stop
 
     def read_mem(self, addr: int, length: int) -> bytes:
         """`m <addr>,<len>` — read raw bytes from target memory."""
@@ -257,12 +304,19 @@ class GdbRsp:
             raise GdbRspError(f"write_mem failed: {reply}")
 
     def read_register(self, regnum: int) -> bytes:
-        """`p <n>` — read one register. Returns raw bytes (target endian)."""
+        """`p <n>` — read one register. Returns raw bytes (target endian).
+
+        Selects the stopped thread first so the value comes from the
+        breakpointed context, not the stub's default thread."""
+        self._select_stop_thread()
         reply = self.cmd(f"p{regnum:x}")
         return bytes.fromhex(reply)
 
     def read_all_registers(self) -> bytes:
-        """`g` — read full register file as raw bytes (target endian)."""
+        """`g` — read full register file as raw bytes (target endian).
+
+        Selects the stopped thread first (see read_register)."""
+        self._select_stop_thread()
         reply = self.cmd("g")
         return bytes.fromhex(reply)
 

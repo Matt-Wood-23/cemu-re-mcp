@@ -89,6 +89,21 @@ Coming from Wii / GameCube tooling, you might expect MEM1/MEM2 split addresses (
 
 For MH3U US v1.3, the main module `mh3g_cafe_us` loads at `0x02000000`, size `0x11b2550`. First two instructions are `nop; blr` (a common entry-stub pattern).
 
+## Attaching (pymem): process selection
+
+`PymemBridge.attach()` (and therefore the MCP's `pymem_attach_tool`, which just calls it) picks the Cemu process like this, first match wins:
+
+1. explicit `pid=` arg, or env **`CEMU_PID`** — attach to that exact PID;
+2. explicit `process=` arg, or env **`CEMU_PROC`** — attach by exe name;
+3. otherwise auto-try **`Cemu.exe`** then **`Cemu_release.exe`**.
+
+The guest region is then located by its entry signature, so it works for any build regardless of how we attached.
+
+Why this matters:
+
+- **Stock Cemu is `Cemu.exe`; the MH3U online fork is `Cemu_release.exe`** (built at `E:\Cemu-src\bin`). `attach()` used to be hardcoded to `Cemu.exe` and threw `Cemu.exe not found` against the fork — the old "attach by PID" workaround. The auto-try now handles the online build with no config.
+- **Multiple Cemu instances** (e.g. an online host + a guest on one machine, or a stock build + the fork side by side): the name-based attach grabs whichever pymem finds first, which is ambiguous. To target a specific one, set **`CEMU_PID`** (or `CEMU_PROC`) in the MCP server's environment *before it starts* — the bridge reads env at `attach()` time, and `pymem_attach_tool` takes no args. For the standalone cheat scripts use the `--pid` flag (e.g. `scripts/mh3u_trainer.py --list` then `--pid <n>`).
+
 ## Acknowledgements
 
 - [Kuriimu2](https://github.com/FanTranslatorsInternational/Kuriimu2) — for confirming the MT Framework ARC `dsize_flag` encoding (an adjacent project but related to the same RE work)

@@ -53,14 +53,48 @@ def health_check_tool() -> dict:
 
 
 @mcp.tool()
-def connect_tool(host: str = "127.0.0.1", port: int = 1337, timeout: float = 5.0) -> dict:
-    """Open a TCP connection to Cemu's GDB stub. Default port 1337."""
+def connect_tool(host: str = "127.0.0.1", port: int = 1337, timeout: float = 5.0,
+                 force: bool = False) -> dict:
+    """Open a TCP connection to Cemu's GDB stub. Default port 1337.
+
+    NOTE: is_connected() only checks the local socket — it can't detect that the
+    remote stub died (e.g. Cemu was restarted). If you restarted Cemu and this
+    returns 'already_connected' against a dead stub, call reconnect_tool (or pass
+    force=True) to drop the stale client and connect fresh — no MCP-server
+    restart needed."""
     global _client
-    if _client is not None and _client.is_connected():
-        return {"status": "already_connected", "host": _client.host, "port": _client.port}
+    if _client is not None and _client.is_connected() and not force:
+        return {"status": "already_connected", "host": _client.host, "port": _client.port,
+                "hint": "if Cemu was restarted this may be stale — use reconnect_tool"}
+    if _client is not None:
+        try:
+            _client.close()
+        except Exception:
+            pass
+        _client = None
     _client = GdbRsp(host=host, port=port, timeout=timeout)
     _client.connect()
     return {"status": "connected", "host": host, "port": port, "no_ack_mode": _client._no_ack}
+
+
+@mcp.tool()
+def reconnect_tool(host: str = "127.0.0.1", port: int = 1337, timeout: float = 5.0) -> dict:
+    """Force-drop any existing GDB client and connect fresh to Cemu's stub.
+
+    Use this after restarting Cemu: the one-shot stub means the old socket is
+    dead, but is_connected() can't tell, so plain connect_tool short-circuits on
+    the stale client and resume/read fail with WinError 10054. This rebuilds the
+    connection in-process — NO MCP-server restart required."""
+    global _client
+    if _client is not None:
+        try:
+            _client.close()
+        except Exception:
+            pass
+        _client = None
+    _client = GdbRsp(host=host, port=port, timeout=timeout)
+    _client.connect()
+    return {"status": "reconnected", "host": host, "port": port}
 
 
 @mcp.tool()
@@ -245,6 +279,52 @@ def get_lr_tool() -> dict:
     return {"lr": f"0x{v:08x}"}
 
 
+# ---------- thread / raw-protocol diagnostics ----------
+
+@mcp.tool()
+def raw_cmd_tool(packet: str) -> dict:
+    """Send a raw GDB RSP packet (no `$`/checksum framing — just the payload,
+    e.g. 'qfThreadInfo', 'qC', 'Hg2EE285C0', 'g') and return the raw reply.
+
+    Escape hatch for protocol-level probing the higher-level tools don't cover."""
+    c = _require_client()
+    try:
+        return {"packet": packet, "reply": c.cmd(packet)}
+    except Exception as e:
+        return {"packet": packet, "error": str(e)}
+
+
+@mcp.tool()
+def list_threads_tool() -> dict:
+    """List the stub's thread IDs via qfThreadInfo/qsThreadInfo, plus the thread
+    that produced the most recent stop (the one register reads now target)."""
+    c = _require_client()
+    threads = []
+    try:
+        reply = c.cmd("qfThreadInfo")
+        while reply and reply[0] == "m":
+            threads.extend(reply[1:].split(","))
+            reply = c.cmd("qsThreadInfo")
+    except Exception as e:
+        return {"error": str(e), "stop_thread": c._stop_thread}
+    return {"threads": threads, "stop_thread": c._stop_thread, "hg_ok": c._hg_ok}
+
+
+@mcp.tool()
+def select_thread_tool(thread: Optional[str] = None) -> dict:
+    """Force the thread used for subsequent register reads (`Hg<tid>`). With no
+    arg, selects the most recent stop thread. Returns the stub's reply."""
+    c = _require_client()
+    tid = thread if thread is not None else c._stop_thread
+    if not tid:
+        return {"error": "no thread specified and no stop thread recorded"}
+    try:
+        reply = c.cmd(f"Hg{tid}")
+        return {"selected": tid, "reply": reply}
+    except Exception as e:
+        return {"thread": tid, "error": str(e)}
+
+
 # ---------- breakpoints / watchpoints ----------
 
 @mcp.tool()
@@ -369,6 +449,138 @@ def capture_on_hit_tool(
                 c.cont()
             except Exception:
                 pass
+
+
+# ---------- pymem fast backend + Cheat-Engine scanner ----------
+# Independent of the GDB stub: attaches directly to Cemu.exe. No connect_tool
+# needed, survives Cemu restarts via pymem_attach_tool (re-derives host_base).
+
+from . import pymem_backend as _pb
+
+
+@mcp.tool()
+def pymem_attach_tool() -> dict:
+    """Attach to Cemu.exe and derive host_base (guest<->host linear map).
+
+    Call once per Cemu launch (host_base changes per launch / ASLR). Re-call
+    after a Cemu restart. Independent of the GDB connection."""
+    return _pb.get_bridge().attach()
+
+
+@mcp.tool()
+def pm_read_tool(addr: str, length: int) -> dict:
+    """Fast read of `length` bytes at guest `addr` (via pymem). Big-endian bytes."""
+    b = _pb.get_bridge()
+    a = int(addr, 0)
+    return {"addr": f"0x{a:08x}", "length": length, "hex": b.read(a, length).hex()}
+
+
+@mcp.tool()
+def pm_read_typed_tool(addr: str, vtype: str = "u32") -> dict:
+    """Fast typed read at guest `addr`. vtype: u8 u16 u32 s32 f32 (big-endian)."""
+    b = _pb.get_bridge()
+    a = int(addr, 0)
+    return {"addr": f"0x{a:08x}", "vtype": vtype, "value": b.read_typed(a, vtype)}
+
+
+@mcp.tool()
+def pm_write_tool(addr: str, hex_data: str) -> dict:
+    """Fast raw write of hex-encoded bytes at guest `addr` (via pymem)."""
+    b = _pb.get_bridge()
+    a = int(addr, 0)
+    n = b.write(a, bytes.fromhex(hex_data))
+    return {"addr": f"0x{a:08x}", "wrote": n}
+
+
+@mcp.tool()
+def pm_write_typed_tool(addr: str, vtype: str, value: float) -> dict:
+    """Fast typed write at guest `addr`. vtype: u8 u16 u32 s32 f32 (big-endian)."""
+    b = _pb.get_bridge()
+    a = int(addr, 0)
+    b.write_typed(a, vtype, value)
+    return {"addr": f"0x{a:08x}", "vtype": vtype, "wrote": value}
+
+
+@mcp.tool()
+def scan_begin_tool(vtype: str = "u32", mode: str = "eq", a: Optional[float] = None,
+                    b: Optional[float] = None, exclude_noise: bool = True) -> dict:
+    """First scan over the whole guest region (~7s). vtype: u8 u16 u32 s32 f32.
+
+    mode 'eq' (a=value), 'range' (a=lo,b=hi), or 'unknown' (snapshot all, for
+    later dec/inc/changed passes). exclude_noise drops MH3U audio buffers."""
+    av = None if a is None else (a if vtype == "f32" else int(a))
+    bv = None if b is None else (b if vtype == "f32" else int(b))
+    return _pb.get_bridge().scan_begin(vtype, mode, av, bv, exclude_noise)
+
+
+@mcp.tool()
+def scan_next_tool(op: str, val: Optional[float] = None) -> dict:
+    """Refine the active scan. ops: dec inc changed unchanged eq lt gt (eq/lt/gt
+    take `val`). Re-reads the region and filters survivors."""
+    return _pb.get_bridge().scan_next(op, val)
+
+
+@mcp.tool()
+def scan_pair_tool(max_lo: int, max_hi: int, neighbor: str = "+") -> dict:
+    """Keep survivors whose adjacent same-width slot is a constant in
+    [max_lo,max_hi] and >= the value — the cur/max-HP adjacency trick.
+    neighbor '+' = max after cur (cur_hp,max_hp), '-' = before."""
+    return _pb.get_bridge().scan_pair(max_lo, max_hi, neighbor)
+
+
+@mcp.tool()
+def scan_region_tool(lo: str, hi: str, exclude: bool = False) -> dict:
+    """Restrict (or exclude) active-scan survivors to guest window [lo,hi)."""
+    return _pb.get_bridge().scan_region(int(lo, 0), int(hi, 0), exclude)
+
+
+@mcp.tool()
+def scan_results_tool(limit: int = 40, addr_lo: str = "0", addr_hi: str = "0") -> dict:
+    """List active-scan survivors, optionally within a guest address window."""
+    return _pb.get_bridge().scan_results(limit, int(addr_lo, 0), int(addr_hi, 0))
+
+
+@mcp.tool()
+def ptr_scan_tool(lo: str, hi: str, limit: int = 120) -> dict:
+    """Find u32 BE pointers landing in [lo,hi). Point at a known live struct
+    addr to recover what references it (struct-base / work-table discovery)."""
+    return _pb.get_bridge().ptr_scan(int(lo, 0), int(hi, 0), limit)
+
+
+@mcp.tool()
+def read_ptr_chain_tool(base: str, offsets: list[int]) -> dict:
+    """Follow base -> [*+off0] -> [*+off1] ... Each deref reads a BE u32.
+    e.g. move_work_table -> PLW (player) or ENEMY_WORK."""
+    return _pb.get_bridge().read_ptr_chain(int(base, 0), offsets)
+
+
+@mcp.tool()
+def hold_start_tool(addr: str, vtype: str, value: float, hz: float = 120.0) -> dict:
+    """Continuously rewrite a value at >30Hz to beat per-frame engine rewrites
+    (e.g. movespeed). Returns immediately; runs on a background thread."""
+    return _pb.get_bridge().hold_start(int(addr, 0), vtype, value, hz)
+
+
+@mcp.tool()
+def hold_stop_tool(addr: str) -> dict:
+    """Stop a hold-write on guest `addr`."""
+    return _pb.get_bridge().hold_stop(int(addr, 0))
+
+
+@mcp.tool()
+def hold_list_tool() -> dict:
+    """List addresses currently being hold-written."""
+    return _pb.get_bridge().hold_list()
+
+
+@mcp.tool()
+def disasm_tool(addr: str, count: int = 16) -> dict:
+    """Disassemble `count` PPC instructions at guest `addr` (Capstone, BE 32-bit).
+    Reads the bytes via pymem."""
+    b = _pb.get_bridge()
+    a = int(addr, 0)
+    code = b.read(a, count * 4)
+    return {"addr": f"0x{a:08x}", "insns": _pb.disasm(code, a, count)}
 
 
 # ---------- entrypoint ----------
