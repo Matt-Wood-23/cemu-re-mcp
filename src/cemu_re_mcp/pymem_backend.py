@@ -1,6 +1,6 @@
 """pymem-backed fast memory access + Cheat-Engine-style scanner for Cemu.
 
-Independent of the GDB stub: attaches directly to ``Cemu.exe`` and treats the
+Independent of the GDB stub: attaches directly to a Cemu process and treats the
 guest 32-bit address space as one linear region inside the host process
 (``host = host_base + guest``). host_base is per-launch (ASLR) and is derived by
 locating the big committed region whose first 8 bytes are the PPC entry
@@ -28,6 +28,7 @@ from typing import Optional
 
 import numpy as np
 import pymem
+import pymem.process
 
 GUEST_BASE = 0x02000000
 ENTRY_SIG = bytes.fromhex("600000004e800020")
@@ -77,12 +78,27 @@ _MEM_COMMIT = 0x1000
 _READABLE = {0x02, 0x04, 0x20, 0x40}  # PAGE_READONLY/READWRITE/EXECUTE_READ/EXECUTE_READWRITE
 
 
+def _cemu_pids() -> list[int]:
+    """PIDs of running processes whose exe name starts with 'cemu', newest first."""
+    pids = []
+    for p in pymem.process.list_processes():
+        name = p.szExeFile.decode(errors="replace").lower()
+        if name.startswith("cemu") and name.endswith(".exe"):
+            pids.append(p.th32ProcessID)
+    try:
+        import psutil
+        pids.sort(key=lambda pid: psutil.Process(pid).create_time(), reverse=True)
+    except Exception:
+        pass
+    return pids
+
+
 class CemuNotRunning(RuntimeError):
     pass
 
 
 class PymemBridge:
-    """Live handle on Cemu.exe with guest<->host translation and a scan state.
+    """Live handle on a Cemu process with guest<->host translation and a scan state.
 
     One instance per MCP-server process. Re-``attach()`` after a Cemu relaunch
     (host_base changes). Scan state (offsets/values) lives in-process.
@@ -109,8 +125,9 @@ class PymemBridge:
             (needed when several Cemu instances run, e.g. a host + a guest for an
             online multiplayer test).
           * explicit ``process`` arg, or env ``CEMU_PROC`` — attach by exe name.
-          * otherwise auto-try the known names: stock ``Cemu.exe`` then the online
-            fork ``Cemu_release.exe``.
+          * otherwise every running ``cemu*.exe`` (stock ``Cemu.exe``, the online
+            fork ``Cemu_release.exe``, ``Cemu_enhanced.exe``, renamed builds),
+            newest first, taking the first one with the game loaded.
         The guest region is then found by its entry signature, so it works for any
         build regardless of how we attached.
         """
@@ -122,21 +139,44 @@ class PymemBridge:
                 self.pm.open_process_from_id(pid)
             except Exception as e:
                 raise CemuNotRunning(f"Cemu pid={pid} not attachable: {e}")
+        elif process or os.environ.get("CEMU_PROC"):
+            name = process or os.environ["CEMU_PROC"]
+            try:
+                self.pm = pymem.Pymem(name)
+            except Exception as e:  # pymem.exception.ProcessNotFound etc.
+                raise CemuNotRunning(f"{name} not attachable: {e}")
         else:
-            names = [process] if process else (
-                [os.environ["CEMU_PROC"]] if os.environ.get("CEMU_PROC")
-                else ["Cemu.exe", "Cemu_release.exe"])
-            last = None
-            self.pm = None
-            for name in names:
-                try:
-                    self.pm = pymem.Pymem(name)
-                    break
-                except Exception as e:  # pymem.exception.ProcessNotFound etc.
-                    last, self.pm = e, None
-            if self.pm is None:
-                raise CemuNotRunning(f"no Cemu process attachable (tried {names}): {last}")
+            return self._attach_any()
         base, size = self._find_region()
+        return self._attached(base, size)
+
+    def _attach_any(self) -> dict:
+        """Every running Cemu, newest first: the first with the game loaded wins,
+        else the first that opens at all."""
+        found = first = None
+        errors = []
+        for pid in _cemu_pids():
+            try:
+                pm = pymem.Pymem()
+                pm.open_process_from_id(pid)
+                self.pm = pm
+                base, size, exact = self._scan_region()
+            except Exception as e:
+                errors.append(f"pid {pid}: {e}")
+                continue
+            if exact:
+                found = (pm, base, size)
+                break
+            first = first or (pm, base, size)
+        pick = found or first
+        if pick is None:
+            self.pm = None
+            raise CemuNotRunning("no Cemu process attachable" + (
+                f" ({'; '.join(errors)})" if errors else " (none running)"))
+        self.pm = pick[0]
+        return self._attached(pick[1], pick[2])
+
+    def _attached(self, base: int, size: int) -> dict:
         self.host_region = base
         self.region_size = size
         return {
@@ -155,6 +195,12 @@ class PymemBridge:
         return self.pm  # type: ignore[return-value]
 
     def _find_region(self) -> tuple[int, int]:
+        base, size, _ = self._scan_region()
+        return base, size
+
+    def _scan_region(self) -> tuple[int, int, bool]:
+        """(base, size, exact): exact = the game's entry signature was found;
+        otherwise the largest big readable region."""
         h = self.pm.process_handle  # type: ignore[union-attr]
         addr = 0
         best = None
@@ -166,7 +212,7 @@ class PymemBridge:
                     and mbi.RegionSize > (256 << 20)):
                 try:
                     if self.pm.read_bytes(mbi.BaseAddress, 8) == ENTRY_SIG:  # type: ignore[union-attr]
-                        return mbi.BaseAddress, mbi.RegionSize
+                        return mbi.BaseAddress, mbi.RegionSize, True
                 except Exception:
                     pass
                 if best is None or mbi.RegionSize > best[1]:
@@ -174,7 +220,7 @@ class PymemBridge:
             addr = mbi.BaseAddress + mbi.RegionSize if mbi.RegionSize else addr + 0x1000
         if best is None:
             raise CemuNotRunning("could not locate Cemu guest region (entry sig not found)")
-        return best
+        return best[0], best[1], False
 
     # ---- typed read/write (guest addresses, big-endian) ----
 
